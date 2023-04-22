@@ -6,6 +6,24 @@ import (
 	//"github.com/stretchr/testify/assert"
 )
 
+func Permute[T any](l []T) [][]T {
+	var out [][]T
+	permute(l, 0, &out)
+	return out
+}
+func permute[T any](l []T, i int, lp *[][]T) {
+	if i+1 < len(l) {
+		permute(l, i+1, lp)
+		for j := i + 1; j < len(l); j++ {
+			l2 := append([]T(nil), l...)
+			l2[i], l2[j] = l2[j], l2[i]
+			permute(l2, i+1, lp)
+		}
+	} else {
+		*lp = append(*lp, l)
+	}
+}
+
 func TestWait(t *testing.T) {
 	ctx := context.Background()
 	tsk := With(ctx)
@@ -20,37 +38,29 @@ func TestWait(t *testing.T) {
 func TestWaitNested(t *testing.T) {
 	ctx := context.Background()
 
-	tsk1 := With(ctx)
-	tsk2 := With(tsk1)
-	tsk3 := With(tsk1)
-	tsk2.Close()
-	tsk3.Close()
-	select {
-	case <-tsk1.Wait():
-		t.Errorf("task is closed")
-	default:
-	}
-	tsk1.Close()
-	select {
-	case <-tsk1.Wait():
-	default:
-		t.Errorf("task not closed")
-	}
+permutation:
+	for _, p := range Permute([]int{0, 1, 2}) {
+		var tasks [3]*Task
+		tasks[0] = With(ctx)
+		tasks[1] = With(tasks[0])
+		tasks[2] = With(tasks[1])
 
-	// flip the order and try again
-	tsk1 = With(ctx)
-	tsk2 = With(tsk1)
-	tsk1.Close()
-	select {
-	case <-tsk1.Wait():
-		t.Errorf("task is closed")
-	default:
-	}
-	tsk2.Close()
-	select {
-	case <-tsk1.Wait():
-	default:
-		t.Errorf("task not closed")
+		for i := 0; i < 2; i++ {
+			tasks[p[i]].Close()
+			select {
+			case <-tasks[0].Wait():
+				t.Errorf("wait didn't block and should have. Closed=%+v", p[:i+1])
+				continue permutation
+			default:
+			}
+		}
+		tasks[p[2]].Close()
+		select {
+		case <-tasks[0].Wait():
+		default:
+			t.Errorf("wait blocked and shouldn't have")
+		}
+
 	}
 }
 
