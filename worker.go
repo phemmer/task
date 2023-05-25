@@ -28,7 +28,7 @@ type Task struct {
 	name       string
 
 	parent   *Task
-	children map[*Task]struct{}
+	children syncMap[*Task, struct{}]
 
 	closed     bool
 	error      error
@@ -60,14 +60,13 @@ func (t *Task) Name() string {
 // Waiting returns a list of names of descendant tasks which are still running.
 func (t *Task) Waiting() []string {
 	var names []string
-	t.mutex.Lock()
-	for ct := range t.children {
+	t.children.Range(func(ct *Task, _ struct{}) bool {
 		names = append(names, ct.Name())
 		for _, name := range ct.Waiting() {
 			names = append(names, ct.Name()+"."+name)
 		}
-	}
-	t.mutex.Unlock()
+		return true
+	})
 	return names
 }
 
@@ -124,14 +123,12 @@ func (t *Task) CloseErrP(err *error) {
 }
 
 func (t *Task) removeChild(tsk *Task) {
-	t.mutex.Lock()
-	delete(t.children, tsk)
+	t.children.Delete(tsk)
 	t.fullClose()
-	t.mutex.Unlock()
 }
 
 func (t *Task) fullClose() {
-	if !t.closed || len(t.children) != 0 {
+	if !t.closed || !t.children.IsEmpty() {
 		return
 	}
 	close(t.waitChan)
@@ -208,7 +205,7 @@ func WithName(parentCtx context.Context, name string, labels ...string) *Task {
 		if parentTask != nil {
 			parentTask.mutex.Lock()
 			if !parentTask.closed {
-				parentTask.children[t] = struct{}{}
+				parentTask.children.Store(t, struct{}{})
 			}
 			t.parent = parentTask
 			if t.name == "" {
