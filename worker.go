@@ -23,7 +23,7 @@ func (te TaskError) Unwrap() error {
 
 type Task struct {
 	ctx        context.Context
-	cancelFunc func()
+	cancelFunc func(cause error)
 	waitChan   chan struct{}
 	name       string
 
@@ -32,7 +32,7 @@ type Task struct {
 
 	closed     bool
 	error      error
-	errorChan  chan error
+	errorChan  atomicValue[chan error]
 	childTotal int
 	mutex      sync.Mutex
 }
@@ -42,14 +42,20 @@ func (t Task) Deadline() (time.Time, bool) { return t.ctx.Deadline() }
 
 // Done is used by the worker to detect when it should abort and exit.
 // Also signals when the task and all its descendants have closed.
-func (t Task) Done() <-chan struct{}             { return t.ctx.Done() }
+func (t Task) Done() <-chan struct{} { return t.ctx.Done() }
+
+// Err provides the reason Done is closed.
+// This does not provide the error returned by the task. For that use Error(). Err is provided to satisfy the Context
+// interface.
 func (t Task) Err() error                        { return t.ctx.Err() }
 func (t Task) Value(key interface{}) interface{} { return t.ctx.Value(key) }
 
-// Cancel sends a notification to the descendant worker(s) to abort and exit.
-func (t Task) Cancel() { t.cancelFunc() }
+// Cancel closes the Done chan of the task and all descendants.
+func (t Task) Cancel() { t.cancelFunc(nil) }
 
-// Wait is used to block until the task and all its descendant workers have closed.
+func (t Task) CancelCause(cause error) { t.cancelFunc(cause) }
+
+// Wait returns a chan which is closed once the task and all its descendants have closed.
 func (t Task) Wait() <-chan struct{} { return t.waitChan }
 
 // Name returns the name for this task.
@@ -101,7 +107,9 @@ func (t *Task) CloseErr(err error) {
 	t.error = err
 	t.closed = true
 	t.fullClose()
-	t.sendError(err)
+	if err != nil {
+		t.sendError(err)
+	}
 	t.mutex.Unlock()
 }
 
@@ -132,8 +140,8 @@ func (t *Task) fullClose() {
 		return
 	}
 	close(t.waitChan)
-	if t.errorChan != nil {
-		close(t.errorChan)
+	if ec := t.errorChan.Load(); ec != nil {
+		close(ec)
 	}
 	// t.Cancel() to signal Done() in case anything tries to check it.
 	// Also to unblock the goroutines that get created by context.WithCancel().
@@ -144,11 +152,9 @@ func (t *Task) fullClose() {
 }
 
 func (t *Task) sendError(err error) {
-	t.mutex.Lock()
-	if t.errorChan != nil {
-		t.errorChan <- err
+	if ec := t.errorChan.Load(); ec != nil {
+		ec <- err
 	}
-	t.mutex.Unlock()
 	if t.parent != nil {
 		if tskErr, ok := err.(TaskError); ok {
 			err = TaskError{
@@ -160,19 +166,27 @@ func (t *Task) sendError(err error) {
 	}
 }
 
+// Error provides the return error of the task if set (with CloseErr or CloseErrP).
+func (t *Task) Error() error {
+	return t.error
+}
+
 // Errors provides a chan which streams all the errors from the task and its descendants.
 // Errors must be called before any descendants return errors for them to be provided. Errors does not need to be called
 // beforehand to provide the error from this task.
 func (t *Task) Errors() <-chan error {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
-	if t.errorChan == nil {
-		t.errorChan = make(chan error, 1)
+	ec := t.errorChan.Load()
+
+	if ec == nil {
+		ec = make(chan error, 1)
+		t.errorChan.CompareAndSwap(nil, ec)
+		ec = t.errorChan.Load()
 		if t.error != nil {
-			t.errorChan <- t.error
+			ec <- t.error
 		}
 	}
-	return t.errorChan
+
+	return ec
 }
 
 // With creates a new Task using parentCtx as the parent context.
@@ -220,7 +234,7 @@ func WithName(parentCtx context.Context, name string, labels ...string) *Task {
 		}
 	}
 
-	t.ctx, t.cancelFunc = context.WithCancel(parentCtx)
+	t.ctx, t.cancelFunc = context.WithCancelCause(parentCtx)
 	t.ctx = context.WithValue(t.ctx, taskContextKey{}, t)
 	t.ctx = pprof.WithLabels(t.ctx, pprof.Labels(append([]string{"_task", t.name}, labels...)...))
 
