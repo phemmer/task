@@ -240,3 +240,22 @@ func WithName(parentCtx context.Context, name string, labels ...string) *Task {
 
 	return t
 }
+
+// Interruptible allows running code which does not support using a context as a cancellation signal, but has some other
+// method for cancellation.
+// The first function f runs the code, and the second function cf is called when the cancellation is needed.
+func Interruptible(parentCtx context.Context, f func() error, cf func()) error {
+	tsk := With(parentCtx)
+	go func(tsk *Task) (err error) {
+		defer tsk.Init().CloseErrP(&err)
+		return f()
+	}(tsk)
+	select {
+	case <-parentCtx.Done():
+		cf()
+		<-tsk.Wait()
+		return tsk.Error()
+	case <-tsk.Wait():
+		return tsk.Error()
+	}
+}
