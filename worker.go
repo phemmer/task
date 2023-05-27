@@ -22,10 +22,11 @@ func (te TaskError) Unwrap() error {
 }
 
 type Task struct {
-	ctx        context.Context
-	cancelFunc func(cause error)
-	waitChan   chan struct{}
-	name       string
+	ctx               context.Context
+	cancelFunc        func(cause error)
+	waitChan          chan struct{}
+	waitChanCloseLock sync.Mutex
+	name              string
 
 	parent   *Task
 	children syncMap[*Task, struct{}]
@@ -139,10 +140,18 @@ func (t *Task) fullClose() {
 	if !t.closed || !t.children.IsEmpty() {
 		return
 	}
-	close(t.waitChan)
-	if ec := t.errorChan.Load(); ec != nil {
-		close(ec)
+
+	t.waitChanCloseLock.Lock()
+	select {
+	case <-t.waitChan:
+	default:
+		close(t.waitChan)
+		if ec := t.errorChan.Load(); ec != nil {
+			close(ec)
+		}
 	}
+	t.waitChanCloseLock.Unlock()
+
 	// t.Cancel() to signal Done() in case anything tries to check it.
 	// Also to unblock the goroutines that get created by context.WithCancel().
 	t.Cancel()
